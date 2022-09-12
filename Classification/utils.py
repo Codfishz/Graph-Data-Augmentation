@@ -3,6 +3,7 @@ import argparse
 from sklearn.metrics import r2_score
 
 def get_args():
+    print("get_args")
     parser = argparse.ArgumentParser(description='Graph rationalization with Environment-based Augmentation')
     parser.add_argument('--device', type=int, default=0,
                         help='which gpu to use if any (default: 0)')
@@ -51,66 +52,63 @@ def get_args():
 
 cls_criterion = torch.nn.BCEWithLogitsLoss()
 reg_criterion = torch.nn.MSELoss()
-def train(args, model, device, loader, optimizers, task_type, optimizer_name):
+def train(model, device, loader, g, optimizers, task_type, optimizer_name):
     optimizer = optimizers[optimizer_name]
     model.train()
     if optimizer_name == 'predictor':
-        set_requires_grad([model.gnn, model.predictor], requires_grad=True)
+        set_requires_grad([model.graph_encoder, model.predictor], requires_grad=True)
         set_requires_grad([model.separator], requires_grad=False)
     if optimizer_name == 'separator':
         set_requires_grad([model.separator], requires_grad=True)
-        set_requires_grad([model.gnn,model.predictor], requires_grad=False)
+        set_requires_grad([model.graph_encoder,model.predictor], requires_grad=False)
         
     for step, batch in enumerate(loader):
-        batch = batch.to(device)
+        batch_x = batch[0].to(device)
+        batch_y = batch[1].to(device)
 
-        if batch.x.shape[0] == 1 or batch.batch[-1] == 0:
-            pass
+        optimizer.zero_grad()
+        pred = model(g, batch_x.t().float())
+        if "classification" in task_type:
+            criterion = cls_criterion
         else:
-            optimizer.zero_grad()
-            pred = model(batch)
-            if "classification" in task_type:
-                criterion = cls_criterion
-            else:
-                criterion = reg_criterion
-
-            batch.y = batch[labels]
+            criterion = reg_criterion
             
-            target = batch.y.to(torch.float32)
-#            is_labeled = (batch.y == batch.y)
-            loss = criterion(pred['pred_rem'].to(torch.float32)[is_labeled], target[is_labeled])
-            target_rep = batch.y.to(torch.float32).repeat_interleave(batch.batch[-1]+1,dim=0)
-            is_labeled_rep = (target_rep == target_rep)
-            loss += criterion(pred['pred_rep'].to(torch.float32)[is_labeled_rep], target_rep[is_labeled_rep])
+        target = batch_y.to(torch.float32)
+        is_labeled = batch_y == batch_y
+        loss = criterion(pred['pred_rem'].to(torch.float32)[is_labeled], batch_y[is_labeled])
+        
+        target_rep = batch_y.to(torch.float32).repeat_interleave(batch_y.size(dim=0),dim=0)
+        is_labeled_rep = (target_rep == target_rep)
+        loss += criterion(pred['pred_rep'].to(torch.float32)[is_labeled_rep], target_rep[is_labeled_rep])
 
-            if optimizer_name == 'separator':
-                loss += pred['loss_reg']
+        if optimizer_name == 'separator':
+            loss += pred['loss_reg']
 
-            loss.backward()
-            if args.use_clip_norm:
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+        loss.backward()
+#            if args.use_clip_norm:
+#                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
 
 
-def eval(args, model, device, loader, evaluator):
+def eval(model, device, loader, g, evaluator):
     model.eval()
     y_true = []
     y_pred = []
 
     for step, batch in enumerate(loader):
-        batch = batch.to(device)
-        if batch.x.shape[0] == 1:
-            pass
-        else:
-            with torch.no_grad():
-                pred = model.eval_forward(batch)
-                batch.y = batch[labels]
-            y_true.append(batch.y.view(pred.shape).detach().cpu())
-            y_pred.append(pred.detach().cpu())
+        batch_x = batch[0].to(device)
+        batch_y = batch[1].to(device)
+        
+        with torch.no_grad():
+            pred = model.eval_forward(g, batch_x)
+        y_true.append(batch_y.view(pred.shape).detach().cpu())
+        y_pred.append(pred.detach().cpu())
+        
     y_true = torch.cat(y_true, dim = 0).numpy()
     y_pred = torch.cat(y_pred, dim = 0).numpy()
     input_dict = {"y_true": y_true, "y_pred": y_pred}
-    return [evaluator.eval(input_dict)['rocauc']]
+    return [evaluator.eval(input_dict)]
 
 
 def init_weights(net, init_type='normal', init_gain=0.02):

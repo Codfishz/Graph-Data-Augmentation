@@ -1,245 +1,218 @@
+# -*- coding: utf-8 -*-
+#
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Graph Isomorphism Networks.
+# pylint: disable= no-member, arguments-differ, invalid-name
+
+import dgl.function as fn
 import torch
-from torch_geometric.nn import MessagePassing
+import torch.nn as nn
 import torch.nn.functional as F
-from torch_geometric.nn import global_mean_pool, global_add_pool
-from torch_geometric.nn.inits import reset
-#from ogb.graphproppred.mol_encoder import AtomEncoder,BondEncoder
-from torch_geometric.utils import degree
-from torch_scatter import scatter_add, scatter_min, scatter_max, scatter_mean
-from torch_geometric.utils import softmax
-from torch_geometric.nn.norm import GraphNorm
-import math
 
-nn_act = torch.nn.ReLU() #ReLU()
-F_act = F.relu
-class GINConv(MessagePassing):
-    def __init__(self, emb_dim):
-        '''
-            emb_dim (int): node embedding dimensionality
-        '''
+__all__ = ['GIN']
 
-        super(GINConv, self).__init__(aggr = "add")
-
-        self.mlp = torch.nn.Sequential(torch.nn.Linear(emb_dim, 2*emb_dim), torch.nn.BatchNorm1d(2*emb_dim), nn_act, torch.nn.Linear(2*emb_dim, emb_dim))
-        self.eps = torch.nn.Parameter(torch.Tensor([0]))
-
-#        self.bond_encoder = BondEncoder(emb_dim = emb_dim)
-
-    def forward(self, x, edge_index, edge_attr):
-#        edge_embedding = self.bond_encoder(edge_attr)
-        out = self.mlp((1 + self.eps) *x + self.propagate(edge_index, x=x, edge_attr=edge_embedding))
-
-        return out
-
-    def message(self, x_j, edge_attr):
-        return F_act(x_j + edge_attr)
-
-    def update(self, aggr_out):
-        return aggr_out
-
-### GCN convolution along the graph structure
-class GCNConv(MessagePassing):
-    def __init__(self, emb_dim):
-        super(GCNConv, self).__init__(aggr='add')
-
-        self.linear = torch.nn.Linear(emb_dim, emb_dim)
-        self.root_emb = torch.nn.Embedding(1, emb_dim)
-#        self.bond_encoder = BondEncoder(emb_dim = emb_dim)
-
-    def forward(self, x, edge_index, edge_attr):
-        x = self.linear(x)
-#        edge_embedding = self.bond_encoder(edge_attr)
-
-        row, col = edge_index
-
-        #edge_weight = torch.ones((edge_index.size(1), ), device=edge_index.device)
-        deg = degree(row, x.size(0), dtype = x.dtype) + 1
-        deg_inv_sqrt = deg.pow(-0.5)
-        deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
-
-        norm = deg_inv_sqrt[row] * deg_inv_sqrt[col]
-
-        return self.propagate(edge_index, x=x, edge_attr = edge_embedding, norm=norm) + F_act(x + self.root_emb.weight) * 1./deg.view(-1,1)
-
-    def message(self, x_j, edge_attr, norm):
-        return norm.view(-1, 1) * F_act(x_j + edge_attr)
-
-    def update(self, aggr_out):
-        return aggr_out
-
-
-### GNN to generate node embedding
-class GNN_node(torch.nn.Module):
+# pylint: disable=W0221, C0103
+class GINLayer(nn.Module):
+    r"""Single Layer GIN from `Strategies for
+    Pre-training Graph Neural Networks <https://arxiv.org/abs/1905.12265>`__
+    Parameters
+    ----------
+    num_edge_emb_list : list of int
+        num_edge_emb_list[i] gives the number of items to embed for the
+        i-th categorical edge feature variables. E.g. num_edge_emb_list[0] can be
+        the number of bond types and num_edge_emb_list[1] can be the number of
+        bond direction types.
+    emb_dim : int
+        The size of each embedding vector.
+    batch_norm : bool
+        Whether to apply batch normalization to the output of message passing.
+        Default to True.
+    activation : None or callable
+        Activation function to apply to the output node representations.
+        Default to None.
     """
-    Output:
-        node representations
-    """
-    def __init__(self, num_layer, emb_dim, drop_ratio = 0.5, JK = "last", residual = False, gnn_name = 'gin'):
-        '''
-            emb_dim (int): node embedding dimensionality
-            num_layer (int): number of GNN message passing layers
-        '''
+    def __init__(self, num_edge_emb_list, emb_dim, batch_norm=True, activation=None):
+        super(GINLayer, self).__init__()
 
-        super(GNN_node, self).__init__()
-        self.num_layer = num_layer
-        self.drop_ratio = drop_ratio
-        self.JK = JK
-        ### add residual connection or not
-        self.residual = residual
+        self.mlp = nn.Sequential(
+            nn.Linear(emb_dim, 2 * emb_dim),
+            nn.ReLU(),
+            nn.Linear(2 * emb_dim, emb_dim)
+        )
+        self.edge_embeddings = nn.ModuleList()
+        for num_emb in num_edge_emb_list:
+            emb_module = nn.Embedding(num_emb, emb_dim)
+            self.edge_embeddings.append(emb_module)
 
-        if self.num_layer < 2:
-            raise ValueError("Number of GNN layers must be greater than 1.")
-
-#        self.atom_encoder = AtomEncoder(emb_dim)
-
-        ###List of GNNs
-        self.convs = torch.nn.ModuleList()
-        self.batch_norms = torch.nn.ModuleList()
-
-        for layer in range(num_layer):
-            if gnn_name == 'gin':
-                self.convs.append(GINConv(emb_dim))
-            elif gnn_name == 'gcn':
-                self.convs.append(GCNConv(emb_dim))
-            else:
-                raise ValueError('Undefined GNN type called {}'.format(gnn_name))
-
-            self.batch_norms.append(torch.nn.BatchNorm1d(emb_dim))
-            # self.batch_norms.append(GraphNorm(emb_dim))
-
-    def forward(self, batched_data):
-        x, edge_index, edge_attr, batch = batched_data.x, batched_data.edge_index, batched_data.edge_attr, batched_data.batch
-
-        ### computing input node embedding
-
-        h_list = [self.atom_encoder(x)]
-        for layer in range(self.num_layer):
-
-            h = self.convs[layer](h_list[layer], edge_index, edge_attr)
-            h = self.batch_norms[layer](h)
-
-            if layer == self.num_layer - 1:
-                #remove relu for the last layer
-                h = F.dropout(h, self.drop_ratio, training = self.training)
-            else:
-                h = F.dropout(F_act(h), self.drop_ratio, training = self.training)
-
-            if self.residual:
-                h += h_list[layer]
-
-            h_list.append(h)
-
-        ### Different implementations of Jk-concat
-        if self.JK == "last":
-            node_representation = h_list[-1]
-        elif self.JK == "sum":
-            node_representation = 0
-            for layer in range(self.num_layer + 1):
-                node_representation += h_list[layer]
-
-        return node_representation
-
-
-### Virtual GNN to generate node embedding
-class GNN_node_Virtualnode(torch.nn.Module):
-    """
-    Output:
-        node representations
-    """
-    def __init__(self, num_layer, emb_dim, drop_ratio = 0.5, JK = "last", residual = False, gnn_name = 'gin', atom_encode=True):
-        '''
-            emb_dim (int): node embedding dimensionality
-        '''
-
-        super(GNN_node_Virtualnode, self).__init__()
-        self.num_layer = num_layer
-        self.drop_ratio = drop_ratio
-        self.JK = JK
-        ### add residual connection or not
-        self.residual = residual
-
-        if self.num_layer < 2:
-            raise ValueError("Number of GNN layers must be greater than 1.")
-
-#        self.atom_encode = atom_encode
-#        if self.atom_encode:
-#            self.atom_encoder = AtomEncoder(emb_dim)
-
-        ### set the initial virtual node embedding to 0.
-        self.virtualnode_embedding = torch.nn.Embedding(1, emb_dim)
-        torch.nn.init.constant_(self.virtualnode_embedding.weight.data, 0)
-
-        ### List of GNNs
-        self.convs = torch.nn.ModuleList()
-        ### batch norms applied to node embeddings
-        self.batch_norms = torch.nn.ModuleList()
-
-        ### List of MLPs to transform virtual node at every layer
-        self.mlp_virtualnode_list = torch.nn.ModuleList()
-
-        for layer in range(num_layer):
-            if gnn_name == 'gin':
-                self.convs.append(GINConv(emb_dim))
-            elif gnn_name == 'gcn':
-                self.convs.append(GCNConv(emb_dim))
-            else:
-                raise ValueError('Undefined GNN type called {}'.format(gnn_name))
-
-            # self.batch_norms.append(GraphNorm(emb_dim))
-            self.batch_norms.append(torch.nn.BatchNorm1d(emb_dim))
-
-        for layer in range(num_layer - 1):
-            self.mlp_virtualnode_list.append(torch.nn.Sequential(torch.nn.Linear(emb_dim, 2*emb_dim), torch.nn.BatchNorm1d(2*emb_dim), nn_act, \
-                                                    torch.nn.Linear(2*emb_dim, emb_dim), torch.nn.BatchNorm1d(emb_dim), nn_act))
-
-
-    def forward(self, batched_data):
-
-        x, edge_index, edge_attr, batch = batched_data.x, batched_data.edge_index, batched_data.edge_attr, batched_data.batch
-
-        ### virtual node embeddings for graphs
-        virtualnode_embedding = self.virtualnode_embedding(torch.zeros(batch[-1].item() + 1).to(edge_index.dtype).to(edge_index.device))
-        if self.atom_encode:
-            h_list = [self.atom_encoder(x)]
+        if batch_norm:
+            self.bn = nn.BatchNorm1d(emb_dim)
         else:
-            h_list = [x]
+            self.bn = None
+        self.activation = activation
+#        self.reset_parameters()
 
-        for layer in range(self.num_layer):
-            ### add message from virtual nodes to graph nodes
-            h_list[layer] = h_list[layer] + virtualnode_embedding[batch]
+    def reset_parameters(self):
+        """Reinitialize model parameters."""
+        for layer in self.mlp:
+            if isinstance(layer, nn.Linear):
+                layer.reset_parameters()
 
-            ### Message passing among graph nodes
-            h = self.convs[layer](h_list[layer], edge_index, edge_attr)
+        for emb_module in self.edge_embeddings:
+            nn.init.xavier_uniform_(emb_module.weight.data)
 
-            h = self.batch_norms[layer](h)
-            if layer == self.num_layer - 1:
-                #remove relu for the last layer
-                h = F.dropout(h, self.drop_ratio, training = self.training)
+        if self.bn is not None:
+            self.bn.reset_parameters()
+
+#    def forward(self, g, node_feats, categorical_edge_feats):
+    def forward(self, g, node_feats):
+        """Update node representations.
+        Parameters
+        ----------
+        g : DGLGraph
+            DGLGraph for a batch of graphs
+        node_feats : FloatTensor of shape (N, emb_dim)
+            * Input node features
+            * N is the total number of nodes in the batch of graphs
+            * emb_dim is the input node feature size, which must match emb_dim in initialization
+        categorical_edge_feats : list of LongTensor of shape (E)
+            * Input categorical edge features
+            * len(categorical_edge_feats) should be the same as len(self.edge_embeddings)
+            * E is the total number of edges in the batch of graphs
+        Returns
+        -------
+        node_feats : float32 tensor of shape (N, emb_dim)
+            Output node representations
+        """
+        edge_embeds = []
+        for i, feats in enumerate(categorical_edge_feats):
+            edge_embeds.append(self.edge_embeddings[i](feats))
+        edge_embeds = torch.stack(edge_embeds, dim=0).sum(0)
+        g = g.local_var()
+        g.ndata['feat'] = node_feats
+#        g.edata['feat'] = edge_embeds
+        g.update_all(fn.u_add_e('feat', 'feat', 'm'), fn.sum('m', 'feat'))
+
+        node_feats = self.mlp(g.ndata.pop('feat'))
+        if self.bn is not None:
+            node_feats = self.bn(node_feats)
+        if self.activation is not None:
+            node_feats = self.activation(node_feats)
+
+        return node_feats
+
+class GIN(nn.Module):
+    r"""Graph Isomorphism Network from `Strategies for
+    Pre-training Graph Neural Networks <https://arxiv.org/abs/1905.12265>`__
+    This module is for updating node representations only.
+    Parameters
+    ----------
+    num_node_emb_list : list of int
+        num_node_emb_list[i] gives the number of items to embed for the
+        i-th categorical node feature variables. E.g. num_node_emb_list[0] can be
+        the number of atom types and num_node_emb_list[1] can be the number of
+        atom chirality types.
+    num_edge_emb_list : list of int
+        num_edge_emb_list[i] gives the number of items to embed for the
+        i-th categorical edge feature variables. E.g. num_edge_emb_list[0] can be
+        the number of bond types and num_edge_emb_list[1] can be the number of
+        bond direction types.
+    num_layers : int
+        Number of GIN layers to use. Default to 5.
+    emb_dim : int
+        The size of each embedding vector. Default to 300.
+    JK : str
+        JK for jumping knowledge as in `Representation Learning on Graphs with
+        Jumping Knowledge Networks <https://arxiv.org/abs/1806.03536>`__. It decides
+        how we are going to combine the all-layer node representations for the final output.
+        There can be four options for this argument, ``concat``, ``last``, ``max`` and ``sum``.
+        Default to 'last'.
+        * ``'concat'``: concatenate the output node representations from all GIN layers
+        * ``'last'``: use the node representations from the last GIN layer
+        * ``'max'``: apply max pooling to the node representations across all GIN layers
+        * ``'sum'``: sum the output node representations from all GIN layers
+    dropout : float
+        Dropout to apply to the output of each GIN layer. Default to 0.5
+    """
+    def __init__(self, num_node_emb_list, num_edge_emb_list,
+                 num_layers=5, emb_dim=300, JK='last', dropout=0.5):
+        super(GIN, self).__init__()
+        self.num_layers = num_layers
+        self.JK = JK
+        self.dropout = nn.Dropout(dropout)
+        if num_layers < 2:
+            raise ValueError('Number of GNN layers must be greater '
+                             'than 1, got {:d}'.format(num_layers))
+
+        self.node_embeddings = nn.ModuleList()
+        for num_emb in num_node_emb_list:
+            emb_module = nn.Embedding(int(num_emb), int(emb_dim))
+            self.node_embeddings.append(emb_module)
+        self.gnn_layers = nn.ModuleList()
+        for layer in range(num_layers):
+            if layer == num_layers - 1:
+                self.gnn_layers.append(GINLayer(num_edge_emb_list, emb_dim))
             else:
-                h = F.dropout(F_act(h), self.drop_ratio, training = self.training)
+                self.gnn_layers.append(GINLayer(num_edge_emb_list, emb_dim, activation=F.relu))
+        print("1")
+#        self.reset_parameters()
 
-            if self.residual:
-                h = h + h_list[layer]
+    def reset_parameters(self):
+        """Reinitialize model parameters."""
+        for emb_module in self.node_embeddings:
+            nn.init.xavier_uniform_(emb_module.weight.data)
 
-            h_list.append(h)
+        for layer in self.gnn_layers:
+            layer.reset_parameters()
 
-            ### update the virtual nodes
-            if layer < self.num_layer - 1:
-                ### add message from graph nodes to virtual nodes
-                virtualnode_embedding_temp = global_add_pool(h_list[layer], batch) + virtualnode_embedding
-                ### transform virtual nodes using MLP
+#    def forward(self, g, categorical_node_feats, categorical_edge_feats):
+    def forward(self, g, categorical_node_feats):
+        """Update node representations
+        Parameters
+        ----------
+        g : DGLGraph
+            DGLGraph for a batch of graphs
+        categorical_node_feats : list of LongTensor of shape (N)
+            * Input categorical node features
+            * len(categorical_node_feats) should be the same as len(self.node_embeddings)
+            * N is the total number of nodes in the batch of graphs
+        categorical_edge_feats : list of LongTensor of shape (E)
+            * Input categorical edge features
+            * len(categorical_edge_feats) should be the same as
+              len(num_edge_emb_list) in the arguments
+            * E is the total number of edges in the batch of graphs
+        Returns
+        -------
+        final_node_feats : float32 tensor of shape (N, M)
+            Output node representations, N for the number of nodes and
+            M for output size. In particular, M will be emb_dim * (num_layers + 1)
+            if self.JK == 'concat' and emb_dim otherwise.
+        """
+        node_embeds = []
+        for i, feats in enumerate(categorical_node_feats):
+            node_embeds.append(self.node_embeddings[i](feats))
+        node_embeds = torch.stack(node_embeds, dim=0).sum(0)
 
-                if self.residual:
-                    virtualnode_embedding = virtualnode_embedding + F.dropout(self.mlp_virtualnode_list[layer](virtualnode_embedding_temp), self.drop_ratio, training = self.training)
-                else:
-                    virtualnode_embedding = F.dropout(self.mlp_virtualnode_list[layer](virtualnode_embedding_temp), self.drop_ratio, training = self.training)
+        all_layer_node_feats = [node_embeds]
+        for layer in range(self.num_layers):
+            node_feats = self.gnn_layers[layer](g, all_layer_node_feats[layer],
+                                                categorical_edge_feats)
+            node_feats = self.dropout(node_feats)
+            all_layer_node_feats.append(node_feats)
 
-        ### Different implementations of Jk-concat
-        if self.JK == "last":
-            node_representation = h_list[-1]
-        elif self.JK == "sum":
-            node_representation = 0
-            for layer in range(self.num_layer + 1):
-                node_representation += h_list[layer]
+        if self.JK == 'concat':
+            final_node_feats = torch.cat(all_layer_node_feats, dim=1)
+        elif self.JK == 'last':
+            final_node_feats = all_layer_node_feats[-1]
+        elif self.JK == 'max':
+            all_layer_node_feats = [h.unsqueeze(0) for h in all_layer_node_feats]
+            final_node_feats = torch.max(torch.cat(all_layer_node_feats, dim=0), dim=0)[0]
+        elif self.JK == 'sum':
+            all_layer_node_feats = [h.unsqueeze(0) for h in all_layer_node_feats]
+            final_node_feats = torch.sum(torch.cat(all_layer_node_feats, dim=0), dim=0)
+        else:
+            return ValueError("Expect self.JK to be 'concat', 'last', "
+                              "'max' or 'sum', got {}".format(self.JK))
 
-        return node_representation
+        return final_node_feats

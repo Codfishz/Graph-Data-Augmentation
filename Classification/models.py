@@ -2,6 +2,8 @@ import numpy
 import torch
 import torch.nn as nn
 from torch.nn.functional import relu
+import torch.nn.functional as F
+from torch_geometric.nn.inits import reset
 import dgl
 from dgl.nn import GINConv
 # -*- coding: utf-8 -*-
@@ -15,104 +17,33 @@ from dgl.nn.pytorch.glob import GlobalAttentionPooling, SumPooling, AvgPooling, 
 
 from conv import GIN
 
+nn_act = torch.nn.ReLU()
+F_act = F.relu
 __all__ = ['GINPredictor']
-
-# pylint: disable=W0221
 class GINPredictor(nn.Module):
-    """GIN-based model for regression and classification on graphs.
-    GIN was first introduced in `How Powerful Are Graph Neural Networks
-    <https://arxiv.org/abs/1810.00826>`__ for general graph property
-    prediction problems. It was further extended in `Strategies for
-    Pre-training Graph Neural Networks <https://arxiv.org/abs/1905.12265>`__
-    for pre-training and semi-supervised learning on large-scale datasets.
-    For classification tasks, the output will be logits, i.e. values before
-    sigmoid or softmax.
-    Parameters
-    ----------
-    num_node_emb_list : list of int
-        num_node_emb_list[i] gives the number of items to embed for the
-        i-th categorical node feature variables. E.g. num_node_emb_list[0] can be
-        the number of atom types and num_node_emb_list[1] can be the number of
-        atom chirality types.
-    num_edge_emb_list : list of int
-        num_edge_emb_list[i] gives the number of items to embed for the
-        i-th categorical edge feature variables. E.g. num_edge_emb_list[0] can be
-        the number of bond types and num_edge_emb_list[1] can be the number of
-        bond direction types.
-    num_layers : int
-        Number of GIN layers to use. Default to 5.
-    emb_dim : int
-        The size of each embedding vector. Default to 300.
-    JK : str
-        JK for jumping knowledge as in `Representation Learning on Graphs with
-        Jumping Knowledge Networks <https://arxiv.org/abs/1806.03536>`__. It decides
-        how we are going to combine the all-layer node representations for the final output.
-        There can be four options for this argument, ``'concat'``, ``'last'``, ``'max'`` and
-        ``'sum'``. Default to 'last'.
-        * ``'concat'``: concatenate the output node representations from all GIN layers
-        * ``'last'``: use the node representations from the last GIN layer
-        * ``'max'``: apply max pooling to the node representations across all GIN layers
-        * ``'sum'``: sum the output node representations from all GIN layers
-    dropout : float
-        Dropout to apply to the output of each GIN layer. Default to 0.5.
-    readout : str
-        Readout for computing graph representations out of node representations, which
-        can be ``'sum'``, ``'mean'``, ``'max'``, ``'attention'``, or ``'set2set'``. Default
-        to 'mean'.
-    n_tasks : int
-        Number of tasks, which is also the output size. Default to 1.
-    """
-    def __init__(self, num_node_emb_list, num_edge_emb_list, num_layers=5,
-                 emb_dim=300, JK='last', dropout=0.5, readout='mean', n_tasks=1,gamma=0.4):
+    def __init__(self,emb_dim=300,dropout=0.5,n_tasks=1,gamma=0.4):
         super(GINPredictor, self).__init__()
-        
-        if num_layers < 2:
-            raise ValueError('Number of GNN layers must be greater '
-                             'than 1, got {:d}'.format(num_layers))
-        
+        self.dropout = dropout
+        self.emb_dim = emb_dim
+        self.num_tasks = n_tasks
+        self.gamma  = gamma
         emb_dim_rat = emb_dim
-        rationale_gnn_node =GIN(num_node_emb_list=num_node_emb_list,
-                       num_edge_emb_list=num_edge_emb_list,
-                       num_layers=2,
-                       emb_dim=emb_dim,
-                       JK=JK,
-                       dropout=dropout)
-        self.gnn = GIN(num_node_emb_list=num_node_emb_list,
-                       num_edge_emb_list=num_edge_emb_list,
-                       num_layers=num_layers,
-                       emb_dim=emb_dim,
-                       JK=JK,
-                       dropout=dropout)
-
-        if readout == 'sum':
-            self.readout = SumPooling()
-        elif readout == 'mean':
-            self.readout = AvgPooling()
-        elif readout == 'max':
-            self.readout = MaxPooling()
-        elif readout == 'attention':
-            if JK == 'concat':
-                self.readout = GlobalAttentionPooling(
-                    gate_nn=nn.Linear((num_layers + 1) * emb_dim, 1))
-            else:
-                self.readout = GlobalAttentionPooling(
-                    gate_nn=nn.Linear(emb_dim, 1))
-        elif readout == 'set2set':
-            self.readout = Set2Set()
-        else:
-            raise ValueError("Expect readout to be 'sum', 'mean', "
-                             "'max', 'attention' or 'set2set', got {}".format(readout))
+        rationale_gnn_node =GIN(2,2,emb_dim_rat,emb_dim_rat*2,emb_dim_rat,0.5, False,"sum","sum")
+        self.graph_encoder = GIN(5,2,emb_dim_rat,emb_dim_rat*2,emb_dim_rat,0.5, False,"sum","sum")
+        print("2")
+        rep_dim = emb_dim
+        self.predictor = torch.nn.Sequential(torch.nn.Linear(rep_dim, 2*emb_dim), torch.nn.BatchNorm1d(2*emb_dim), nn_act, torch.nn.Dropout(), torch.nn.Linear(2*emb_dim, self.num_tasks))
+        print("3")
         self.separator = separator(
             rationale_gnn_node=rationale_gnn_node,
             gate_nn = torch.nn.Sequential(torch.nn.Linear(emb_dim_rat, 2*emb_dim_rat), torch.nn.BatchNorm1d(2*emb_dim_rat), torch.nn.ReLU(), torch.nn.Dropout(), torch.nn.Linear(2*emb_dim_rat, 1)),
             nn=None
             )
-        if JK == 'concat':
-            self.predict = nn.Linear((num_layers + 1) * emb_dim, n_tasks)
-        else:
-            self.predict = nn.Linear(emb_dim, n_tasks)
+        print("4")
+        self.predict = nn.Linear(emb_dim, n_tasks)
+        print("5")
 
-    def forward(self, g, categorical_node_feats, categorical_edge_feats):
+    def forward(self, g, h):
         """Graph-level regression/soft classification.
         Parameters
         ----------
@@ -133,11 +64,8 @@ class GINPredictor(nn.Module):
             * Predictions on graphs
             * B for the number of graphs in the batch
         """
-#        node_feats = self.gnn(g, categorical_node_feats, categorical_edge_feats)
-#        graph_feats = self.readout(g, node_feats)
-#        return self.predict(graph_feats)
-        h_node = self.gnn(batched_data)
-        h_r, h_env, r_node_num, env_node_num = self.separator(batched_data, h_node)
+        h_node = self.graph_encoder(g,h)
+        h_r, h_env, r_node_num, env_node_num = self.separator(g, h, h_node)
         h_rep = (h_r.unsqueeze(1) + h_env.unsqueeze(0)).view(-1, self.emb_dim)
         
         pred_rem = self.predictor(h_r)
@@ -147,13 +75,12 @@ class GINPredictor(nn.Module):
         loss_reg += (self.separator.non_zero_node_ratio - self.gamma  * torch.ones_like(r_node_num)).mean()
 
         output = {'pred_rep': pred_rep, 'pred_rem': pred_rem, 'loss_reg':loss_reg}
-#        output = {'pred_rep': pred_rep, 'loss_reg':loss_reg}
         return output
         
-    def eval_forward(self, batched_data):
-        h_node = self.gnn(batched_data)
-        h_r, _, _, _ = self.separator(batched_data, h_node)
-        pred_rem = self.predict(h_r)
+    def eval_forward(self,g,h):
+        h_node = self.graph_encoder(g,h)
+        h_r, _, _, _ = self.separator(g, h, h_node)
+        pred_rem = self.predictor(h_r)
         return pred_rem
 
 class separator(torch.nn.Module):
@@ -169,25 +96,29 @@ class separator(torch.nn.Module):
         reset(self.gate_nn)
         reset(self.nn)
 
-    def forward(self, batched_data, h_node, size=None):
-        x = self.rationale_gnn_node(batched_data)
-        batch = batched_data.batch
+    def forward(self, g, h, h_node, size=None):
+        x = self.rationale_gnn_node(g,h)
+        
         x = x.unsqueeze(-1) if x.dim() == 1 else x
-        size = batch[-1].item() + 1 if size is None else size
+        size = h.size(dim=0)
 
         gate = self.gate_nn(x).view(-1, 1)
         h_node = self.nn(h_node) if self.nn is not None else h_node
         assert gate.dim() == h_node.dim() and gate.size(0) == h_node.size(0)
         gate = torch.sigmoid(gate)
 
-        h_out = scatter_add(gate * h_node, batch, dim=0, dim_size=size)
-        c_out = scatter_add((1 - gate) * h_node, batch, dim=0, dim_size=size)
+#        h_out = scatter_add(gate * h_node, h, dim=0, dim_size=size)
+#        c_out = scatter_add((1 - gate) * h_node, h, dim=0, dim_size=size)
+        h_out = torch.ones_like(1,size) *(gate * h_node)
+        c_out = torch.ones_like(1,size) *((1 - gate) * h_node)
 
-        r_node_num = scatter_add(gate, batch, dim=0, dim_size=size)
-        env_node_num = scatter_add((1 - gate), batch, dim=0, dim_size=size)
+        r_node_num = scatter_add(gate, h, dim=0, dim_size=size)
+        env_node_num = scatter_add((1 - gate), h, dim=0, dim_size=size)
 
-        non_zero_nodes = scatter_add((gate > 0).to(torch.float32), batch, dim=0, dim_size=size)
-        all_nodes = scatter_add(torch.ones_like(gate).to(torch.float32), batch, dim=0, dim_size=size)
+#        non_zero_nodes = scatter_add((gate > 0).to(torch.float32), batch, dim=0, dim_size=size)
+#        all_nodes = scatter_add(torch.ones_like(gate).to(torch.float32), batch, dim=0, dim_size=size)
+        non_zero_nodes = scatter_add((gate > 0).to(torch.float32), h, dim=0, dim_size=size)
+        all_nodes = scatter_add(torch.ones_like(gate).to(torch.float32), h, dim=0, dim_size=size)
         self.non_zero_node_ratio = non_zero_nodes / all_nodes
 
         return h_out, c_out, r_node_num + 1e-8 , env_node_num + 1e-8
